@@ -1,18 +1,19 @@
-import datetime
-import importlib.resources as resources
+
+import datetime 
 import os
 import re 
-import streamlit as st
+
 
 def create_agent_data(agent):
     expert_name = agent['config']['name']
-    description = agent['description']
+    description = agent['config'].get('description', agent.get('description', ''))  # Get description from config, default to empty string if missing
     current_timestamp = datetime.datetime.now().isoformat()
 
     formatted_expert_name = sanitize_text(expert_name)
     formatted_expert_name = formatted_expert_name.lower().replace(' ', '_')
 
     sanitized_description = sanitize_text(description)
+    temperature_value = 0.1  # Default value for temperature
 
     autogen_agent_data = {
         "type": "assistant",
@@ -23,14 +24,14 @@ def create_agent_data(agent):
                     {
                         "user_id": "default",
                         "timestamp": current_timestamp,
-                        "model": "gpt-4",
+                        "model": agent['config']['llm_config']['config_list'][0]['model'],
                         "base_url": None,
                         "api_type": None,
                         "api_version": None,
                         "description": "OpenAI model configuration"
                     }
                 ],
-                "temperature": st.session_state.get('temperature', 0.1),
+                "temperature": temperature_value,
                 "cache_seed": None,
                 "timeout": None,
                 "max_tokens": None,
@@ -49,8 +50,8 @@ def create_agent_data(agent):
         "skills": []
     }
 
-    #script_dir = os.path.dirname(os.path.abspath(__file__))
-    skill_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    skill_folder = os.path.join(project_root, "skills")
     skill_files = [f for f in os.listdir(skill_folder) if f.endswith(".py")]
 
     for skill_file in skill_files:
@@ -70,7 +71,7 @@ def create_agent_data(agent):
     }
 
     return autogen_agent_data, crewai_agent_data
-        
+
 
 def create_skill_data(python_code):
     # Extract the function name from the Python code
