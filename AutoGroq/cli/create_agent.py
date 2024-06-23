@@ -3,16 +3,18 @@ import argparse
 import datetime
 import json
 import os
+import streamlit as st
 import sys
 
 # Add the root directory to the Python module search path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import MODEL_TOKEN_LIMITS
+from configs.config import MODEL_TOKEN_LIMITS
 from prompts import get_agent_prompt
 from utils.api_utils import get_llm_provider
+from utils.agent_utils import create_agent_data
 from utils.auth_utils import get_api_key
-from utils.file_utils import create_agent_data, sanitize_text
+from utils.file_utils import sanitize_text
 
 def create_agent(request, provider, model, temperature, max_tokens, output_file):
     # Get the API key and provider
@@ -28,7 +30,7 @@ def create_agent(request, provider, model, temperature, max_tokens, output_file)
     # Make the request to the LLM API
     llm_request_data = {
         "model": model,
-        "temperature": temperature,
+        "temperature": st.session_state.temperature,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -80,7 +82,7 @@ def create_agent(request, provider, model, temperature, max_tokens, output_file)
         },
         "timestamp": datetime.datetime.now().isoformat(),
         "user_id": "default",
-        "skills": []
+        "tools": []
     }
 
     # Debug print to verify agent_data

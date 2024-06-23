@@ -1,5 +1,6 @@
 import json
 import requests
+import streamlit as st
 
 from llm_providers.base_provider import BaseLLMProvider
 
@@ -37,7 +38,7 @@ class OllamaProvider(BaseLLMProvider):
         ollama_request_data = {
             "model": data["model"],
             "prompt": data["messages"][0]["content"],
-            "temperature": data.get("temperature", 0.1),
+            "temperature": st.session_state.temperature,
             "max_tokens": data.get("max_tokens", 2048),
             "stop": data.get("stop", "TERMINATE"),
             "stream": False,

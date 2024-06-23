@@ -2,9 +2,10 @@
 import datetime
 import streamlit as st
 
-from config import MODEL_TOKEN_LIMITS
+from configs.config import MODEL_TOKEN_LIMITS
 
-from utils.file_utils import create_agent_data, sanitize_text
+from utils.agent_utils import create_agent_data
+from utils.file_utils import sanitize_text
 
 
 def get_workflow_from_agents(agents):
@@ -32,7 +33,7 @@ def get_workflow_from_agents(agents):
             },
             "timestamp": current_timestamp,
             "user_id": "default",
-            "skills": []
+            "tools": []
         },
         "receiver": {
             "type": "groupchat",
@@ -42,7 +43,7 @@ def get_workflow_from_agents(agents):
                     "config_list": [
                         {
                             "user_id": "default",
-                            "timestamp": datetime.datetime.now().isoformat(),
+                            "timestamp": current_timestamp,
                             "model": st.session_state.model,
                             "base_url": None,
                             "api_type": None,
@@ -50,7 +51,7 @@ def get_workflow_from_agents(agents):
                             "description": "OpenAI model configuration"
                         }
                     ],
-                    "temperature": temperature_value,
+                    "temperature": st.session_state.temperature,
                     "cache_seed": 42,
                     "timeout": 600,
                     "max_tokens": MODEL_TOKEN_LIMITS.get(st.session_state.model, 4096),
@@ -74,7 +75,7 @@ def get_workflow_from_agents(agents):
             },
             "timestamp": current_timestamp,
             "user_id": "default",
-            "skills": []
+            "tools": []
         },
         "type": "groupchat",
         "user_id": "default",
@@ -90,9 +91,6 @@ def get_workflow_from_agents(agents):
         
         system_message = f"You are a helpful assistant that can act as {agent_name} who {sanitized_description}."
         if index == 0:
-            other_agent_names = [sanitize_text(a['config']['name']).lower().replace(' ', '_') for a in agents[1:] if a in st.session_state.agents]  # Filter out deleted agents
-            system_message += f" You are the primary coordinator who will receive suggestions or advice from all the other agents ({', '.join(other_agent_names)}). You must ensure that the final response integrates the suggestions from other agents or team members. YOUR FINAL RESPONSE MUST OFFER THE COMPLETE RESOLUTION TO THE USER'S REQUEST. When the user's request has been satisfied and all perspectives are integrated, you can respond with TERMINATE."
-
             other_agent_names = [sanitize_text(a['config']['name']).lower().replace(' ', '_') for a in agents[1:]]
             system_message += f" You are the primary coordinator who will receive suggestions or advice from all the other agents ({', '.join(other_agent_names)}). You must ensure that the final response integrates the suggestions from other agents or team members. YOUR FINAL RESPONSE MUST OFFER THE COMPLETE RESOLUTION TO THE USER'S REQUEST. When the user's request has been satisfied and all perspectives are integrated, you can respond with TERMINATE."
 
@@ -104,7 +102,7 @@ def get_workflow_from_agents(agents):
                     "config_list": [
                         {
                             "user_id": "default",
-                            "timestamp": datetime.datetime.now().isoformat(),
+                            "timestamp": current_timestamp,
                             "model": st.session_state.model,
                             "base_url": None,
                             "api_type": None,
@@ -112,7 +110,7 @@ def get_workflow_from_agents(agents):
                             "description": "OpenAI model configuration"
                         }
                     ],
-                    "temperature": temperature_value,
+                    "temperature": st.session_state.temperature,
                     "cache_seed": 42,
                     "timeout": 600,
                     "max_tokens": MODEL_TOKEN_LIMITS.get(st.session_state.model, 4096),
@@ -128,16 +126,17 @@ def get_workflow_from_agents(agents):
             },
             "timestamp": current_timestamp,
             "user_id": "default",
-            "skills": []  # Set skills to null only in the workflow JSON
+            "tools": []  # Set tools to null only in the workflow JSON
         }
 
         workflow["receiver"]["groupchat_config"]["agents"].append(agent_config)
 
+    print("Debug: Workflow agents assigned:")
+    for agent in workflow["receiver"]["groupchat_config"]["agents"]:
+        print(agent)
+
     crewai_agents = []
     for agent in agents:
-        if agent not in st.session_state.agents:  # Check if the agent exists in st.session_state.agents
-            continue  # Skip the agent if it has been deleted
-        
         _, crewai_agent_data = create_agent_data(agent)
         crewai_agents.append(crewai_agent_data)
 
