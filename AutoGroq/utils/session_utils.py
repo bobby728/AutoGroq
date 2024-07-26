@@ -1,6 +1,9 @@
 
 import streamlit as st
 
+from agents.code_developer import CodeDeveloperAgent
+from agents.code_tester import CodeTesterAgent
+from agents.web_content_retriever import WebContentRetrieverAgent
 from configs.config import LLM_PROVIDER, SUPPORTED_PROVIDERS
 from configs.config_sessions import DEFAULT_AGENT_CONFIG
 from configs.current_project import Current_Project
@@ -9,10 +12,12 @@ from models.agent_base_model import AgentBaseModel
 from models.project_base_model import ProjectBaseModel
 from models.tool_base_model import ToolBaseModel
 from models.workflow_base_model import WorkflowBaseModel
+from utils.ui_utils import handle_user_request
 
 
 def create_default_agent():
     return AgentBaseModel(**DEFAULT_AGENT_CONFIG)
+
 
 def initialize_session_variables():
 
@@ -24,6 +29,18 @@ def initialize_session_variables():
 
     if "agents" not in st.session_state:
         st.session_state.agents = []
+
+    # Ensure built-in agents are always present
+    built_in_agents = [
+        WebContentRetrieverAgent.create_default(),
+        CodeDeveloperAgent.create_default(),
+        CodeTesterAgent.create_default()
+    ]
+
+    # Add built-in agents if they're not already in the list
+    for built_in_agent in built_in_agents:
+        if not any(agent.name == built_in_agent.name for agent in st.session_state.agents):
+            st.session_state.agents.append(built_in_agent)
 
     if "api_key" not in st.session_state:
         st.session_state.api_key = ""
@@ -55,6 +72,9 @@ def initialize_session_variables():
     if "model" not in st.session_state:
         st.session_state.model = "default"
 
+    if "most_recent_response" not in st.session_state:
+        st.session_state.most_recent_response = ""
+
     if "previous_user_request" not in st.session_state:
         st.session_state.previous_user_request = ""        
 
@@ -72,6 +92,12 @@ def initialize_session_variables():
 
     if "rephrased_request" not in st.session_state:
         st.session_state.rephrased_request = ""
+
+    if "response_text" not in st.session_state:       
+        st.session_state.response_text = ""
+
+    if "show_edit" not in st.session_state:
+        st.session_state.show_edit = False        
 
     if "selected_tools" not in st.session_state:
         st.session_state.selected_tools = []
@@ -114,6 +140,9 @@ def initialize_session_variables():
     if "tool_request" not in st.session_state:
         st.session_state.tool_request = ""
 
+    if "tool_result_string" not in st.session_state:
+        st.session_state.tool_result_string = ""
+
     if "top_p" not in st.session_state:
           st.session_state.top_p = 1
 
@@ -126,11 +155,11 @@ def initialize_session_variables():
     if "user_input_widget_auto_moderate" not in st.session_state:
             st.session_state.user_input_widget_auto_moderate = ""
 
-    if "user_request" not in st.session_state:
-        st.session_state.user_request = ""
+    if st.session_state.get("user_request"):
+        handle_user_request(st.session_state)
 
-    if "whiteboard" not in st.session_state:
-        st.session_state.whiteboard = ""
+    if "whiteboard_content" not in st.session_state:
+        st.session_state.whiteboard_content = ""
 
     if "workflow" not in st.session_state:
         st.session_state.workflow = WorkflowBaseModel(

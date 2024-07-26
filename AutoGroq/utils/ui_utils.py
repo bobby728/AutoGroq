@@ -3,27 +3,78 @@ import json
 import os
 import pandas as pd
 import re
+import requests
 import streamlit as st
 import time
 
-from configs.config import (API_URL, DEBUG, LLM_PROVIDER, MAX_RETRIES, 
-        MODEL_CHOICES, MODEL_TOKEN_LIMITS, RETRY_DELAY, SUPPORTED_PROVIDERS)
+import logging
 
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+from configs.config import (DEBUG, LLM_PROVIDER, MAX_RETRIES, 
+        FALLBACK_MODEL_TOKEN_LIMITS, RETRY_DELAY, SUPPORTED_PROVIDERS)
+
+from anthropic.types import Message
 from configs.current_project import Current_Project
 from models.agent_base_model import AgentBaseModel
 from models.workflow_base_model import WorkflowBaseModel
-from prompts import create_project_manager_prompt, get_agents_prompt, get_rephrased_user_prompt  
+from prompts import create_project_manager_prompt, get_agents_prompt, get_rephrased_user_prompt, get_moderator_prompt  
 from tools.fetch_web_content import fetch_web_content
-from utils.api_utils import get_api_key, get_llm_provider
-from utils.auth_utils import check_api_key, display_api_key_input
+from typing import Any, List, Dict, Tuple
+from utils.agent_utils import create_agent_data
+from utils.api_utils import fetch_available_models, get_api_key, get_llm_provider
+from utils.auth_utils import display_api_key_input
 from utils.db_utils import export_to_autogen
 from utils.file_utils import zip_files_in_memory
 from utils.workflow_utils import get_workflow_from_agents
-from prompts import get_moderator_prompt
     
+
+def create_agents(json_data: List[Dict[str, Any]]) -> Tuple[List[AgentBaseModel], List[Dict[str, Any]]]:
+    autogen_agents = []
+    crewai_agents = []
     
-def create_project_manager(rephrased_text, api_url):
-    print(f"Creating Project Manager; API_URL: {api_url}")
+    for agent_data in json_data:
+        expert_name = agent_data.get('expert_name', '')
+        description = agent_data.get('description', '')
+        
+        if not expert_name:
+            print("Missing agent name. Skipping...")
+            continue
+
+        autogen_agent_data, crewai_agent_data = create_agent_data({
+            "name": expert_name,
+            "description": description,
+            "role": agent_data.get('role', expert_name),
+            "goal": agent_data.get('goal', f"Assist with tasks related to {description}"),
+            "backstory": agent_data.get('backstory', f"As an AI assistant, I specialize in {description}")
+        })
+        
+        try:
+            agent_model = AgentBaseModel(
+                name=autogen_agent_data['name'],
+                description=autogen_agent_data['description'],
+                tools=autogen_agent_data.get('tools', []),
+                config=autogen_agent_data.get('config', {}),
+                role=autogen_agent_data['role'],
+                goal=autogen_agent_data['goal'],
+                backstory=autogen_agent_data['backstory'],
+                provider=autogen_agent_data.get('provider', ''),
+                model=autogen_agent_data.get('model', '')
+            )
+            print(f"Created agent: {agent_model.name} with description: {agent_model.description}")
+            autogen_agents.append(agent_model)
+            crewai_agents.append(crewai_agent_data)
+        except Exception as e:
+            print(f"Error creating agent {expert_name}: {str(e)}")
+            print(f"Agent data: {autogen_agent_data}")
+            continue
+
+    return autogen_agents, crewai_agents
+
+
+def create_project_manager(rephrased_text):
+    print(f"Creating Project Manager")
     temperature_value = st.session_state.get('temperature', 0.1)
     llm_request_data = {
         "model": st.session_state.model,
@@ -43,7 +94,7 @@ def create_project_manager(rephrased_text, api_url):
     llm_provider = get_llm_provider(api_key=api_key)
     response = llm_provider.send_request(llm_request_data)
     
-    if response.status_code == 200:
+    if response is not None:
         response_data = llm_provider.process_response(response)
         if "choices" in response_data and response_data["choices"]:
             content = response_data["choices"][0]["message"]["content"]
@@ -52,28 +103,31 @@ def create_project_manager(rephrased_text, api_url):
     return None
 
 
-# def display_api_key_input():
-#     llm = LLM_PROVIDER.upper()
-#     api_key = st.text_input(f"Enter your {llm}_API_KEY:", type="password", value="", key="api_key_input")
-#     if api_key:
-#         st.session_state[f"{LLM_PROVIDER.upper()}_API_KEY"] = api_key
-#         st.success("API Key entered successfully.")
-#     return api_key
-
-
 def display_discussion_and_whiteboard():
+    tabs = st.tabs(["Discussion", "Whiteboard", "History", "Deliverables", "Download", "Debug"])
     discussion_history = get_discussion_history()
 
-    tabs = st.tabs(["Most Recent Comment", "Whiteboard", "Discussion History", "Deliverables", "Downloads", "Debug"])
-
     with tabs[0]:
-        st.text_area("Most Recent Comment", value=st.session_state.last_comment, height=400, key="discussion")
+        # Display only the most recent agent response
+        if 'most_recent_response' in st.session_state and st.session_state.most_recent_response:
+            st.text_area("Most Recent Response", value=st.session_state.most_recent_response, height=400, key="discussion")
+        else:
+            st.text_area("Discussion", value="No responses yet.", height=400, key="discussion")
 
     with tabs[1]:
-        st.text_area("Whiteboard", value=st.session_state.whiteboard, height=400, key="whiteboard")
+        # Extract code snippets from the full discussion history
+        code_snippets = extract_code_from_response(discussion_history)
+        
+        # Display code snippets in the whiteboard, allowing editing
+        new_whiteboard_content = st.text_area("Whiteboard (Code Snippets)", value=code_snippets, height=400, key="whiteboard")
+        
+        # Update the whiteboard content in the session state if it has changed
+        if new_whiteboard_content != st.session_state.get('whiteboard_content', ''):
+            st.session_state.whiteboard_content = new_whiteboard_content
 
     with tabs[2]:
         st.write(discussion_history)
+
 
     with tabs[3]:
         if "current_project" in st.session_state:
@@ -81,12 +135,21 @@ def display_discussion_and_whiteboard():
             for index, deliverable in enumerate(current_project.deliverables):
                 if deliverable["text"].strip():  # Check if the deliverable text is not empty
                     checkbox_key = f"deliverable_{index}"
-                    done = st.checkbox(deliverable["text"], value=deliverable["done"], key=checkbox_key)
+                    done = st.checkbox(
+                        deliverable["text"], 
+                        value=current_project.is_deliverable_complete(index),
+                        key=checkbox_key,
+                        on_change=update_deliverable_status,
+                        args=(index,)
+                    )
                     if done != deliverable["done"]:
                         if done:
-                            current_project.mark_deliverable_done(index)
+                            current_project.mark_deliverable_phase_done(index, current_project.current_phase)
                         else:
-                            current_project.mark_deliverable_undone(index)
+                            current_project.deliverables[index]["done"] = False
+                            for phase in current_project.implementation_phases:
+                                current_project.deliverables[index]["phase"][phase] = False
+
 
     with tabs[4]:
         display_download_button() 
@@ -237,28 +300,34 @@ def display_discussion_and_whiteboard():
 
         else:
             st.warning("Debugging disabled.")   
-
-        
-                            
+                                    
 
 def display_download_button():
     col1, col2 = st.columns(RETRY_DELAY)
+    
     with col1:
-        st.download_button(
-            label="Download Autogen Files",
-            data=st.session_state.autogen_zip_buffer,
-            file_name="autogen_files.zip",
-            mime="application/zip",
-            key=f"autogen_download_button_{int(time.time())}"  # Generate a unique key based on timestamp
-        )
+        if st.session_state.get('autogen_zip_buffer') is not None:
+            st.download_button(
+                label="Download Autogen Files",
+                data=st.session_state.autogen_zip_buffer,
+                file_name="autogen_files.zip",
+                mime="application/zip",
+                key=f"autogen_download_button_{int(time.time())}"
+            )
+        else:
+            st.warning("Autogen files are not available for download.")
+    
     with col2:
-        st.download_button(
-            label="Download CrewAI Files",
-            data=st.session_state.crewai_zip_buffer,
-            file_name="crewai_files.zip",
-            mime="application/zip",
-            key=f"crewai_download_button_{int(time.time())}"  # Generate a unique key based on timestamp
-        )
+        if st.session_state.get('crewai_zip_buffer') is not None:
+            st.download_button(
+                label="Download CrewAI Files",
+                data=st.session_state.crewai_zip_buffer,
+                file_name="crewai_files.zip",
+                mime="application/zip",
+                key=f"crewai_download_button_{int(time.time())}"
+            )
+        else:
+            st.warning("CrewAI files are not available for download.")
 
 
 def display_download_and_export_buttons():
@@ -367,12 +436,36 @@ def extract_code_from_response(response):
 
     return "\n\n".join(unique_code_blocks) 
 
+
+def extract_content(response: Any) -> str:
+    if hasattr(response, 'content') and isinstance(response.content, list):
+        # Anthropic-specific handling
+        return response.content[0].text
+    elif isinstance(response, requests.models.Response):
+        # Groq and potentially other providers using requests.Response
+        try:
+            json_response = response.json()
+            if 'choices' in json_response and json_response['choices']:
+                return json_response['choices'][0]['message']['content']
+        except json.JSONDecodeError:
+            print("Failed to decode JSON from response")
+            return ""
+    elif isinstance(response, dict):
+        if 'choices' in response and response['choices']:
+            return response['choices'][0]['message']['content']
+        elif 'content' in response:
+            return response['content']
+    elif isinstance(response, str):
+        return response
+    print(f"Unexpected response format: {type(response)}")
+    return ""
  
-def extract_json_objects(json_string):
+
+def extract_json_objects(text: str) -> List[Dict]:
     objects = []
     stack = []
     start_index = 0
-    for i, char in enumerate(json_string):
+    for i, char in enumerate(text):
         if char == "{":
             if not stack:
                 start_index = i
@@ -381,7 +474,7 @@ def extract_json_objects(json_string):
             if stack:
                 stack.pop()
                 if not stack:
-                    objects.append(json_string[start_index:i+1])
+                    objects.append(text[start_index:i+1])
     parsed_objects = []
     for obj_str in objects:
         try:
@@ -391,205 +484,61 @@ def extract_json_objects(json_string):
             print(f"Error parsing JSON object: {e}")
             print(f"JSON string: {obj_str}")
     return parsed_objects
-                
 
-def get_agents_from_text(text, max_retries=MAX_RETRIES, retry_delay=RETRY_DELAY):     
+
+def get_agents_from_text(text: str) -> Tuple[List[AgentBaseModel], List[Dict[str, Any]]]:
     print("Getting agents from text...")
-    temperature_value = st.session_state.get('temperature', 0.5)
+    
+    instructions = get_agents_prompt()
+    combined_content = f"{instructions}\n\nTeam of Experts:\n{text}"
+    
     llm_request_data = {
         "model": st.session_state.model,
         "temperature": st.session_state.temperature,
         "max_tokens": st.session_state.max_tokens,
-        "top_p": 1,
-        "stop": "TERMINATE",
         "messages": [
-            {
-                "role": "system",
-                "content": get_agents_prompt()
-            },
-            {
-                "role": "user",
-                "content": text
-            }
+            {"role": "user", "content": combined_content}
         ]
     }
+    
     api_key = get_api_key()
     llm_provider = get_llm_provider(api_key=api_key)
-    retry_count = 0
-    while retry_count < max_retries:
-        try:
-            response = llm_provider.send_request(llm_request_data)
-            print(f"Response received. Status Code: {response.status_code}")
-            if response.status_code == 200:
-                print("Request successful. Parsing response...")
-                response_data = llm_provider.process_response(response)
-                print(f"Response Data: {json.dumps(response_data, indent=2)}")
-                if "choices" in response_data and response_data["choices"]:
-                    content = response_data["choices"][0]["message"]["content"]
-                    print(f"Content: {content}")
+    
+    try:
+        response = llm_provider.send_request(llm_request_data)
+        print(f"Response type: {type(response)}")
+        print(f"Response: {response}")
 
-                    # Preprocess the JSON string
-                    content = content.replace("\\n", "\n").replace('\\"', '"')
+        content = extract_content(response)
+        
+        if not content:
+            print("No content extracted from response.")
+            return [], []
 
-                    try:
-                        json_data = json.loads(content)
-                        if isinstance(json_data, list):
-                            autogen_agents = []
-                            crewai_agents = []
-                            for index, agent_data in enumerate(json_data, start=1):
-                                expert_name = agent_data.get('expert_name', '')
-                                if not expert_name:
-                                    print("Missing agent name. Retrying...")
-                                    retry_count += 1
-                                    time.sleep(retry_delay)
-                                    continue
-                                description = agent_data.get('description', '')
-                                tools = agent_data.get('tools', [])
-                                agent_tools = st.session_state.selected_tools
-                                current_timestamp = datetime.datetime.now().isoformat()
-                                autogen_agent_data = {
-                                    "id": index,
-                                    "name": expert_name,
-                                    "type": "assistant",
-                                    "config": {
-                                        "name": expert_name,
-                                        "llm_config": {
-                                            "config_list": [
-                                                {
-                                                    "user_id": "default",
-                                                    "timestamp": current_timestamp,
-                                                    "model": st.session_state.model,
-                                                    "base_url": None,
-                                                    "api_type": None,
-                                                    "api_version": None,
-                                                    "description": "OpenAI model configuration"
-                                                }
-                                            ],
-                                            "temperature": st.session_state.temperature,
-                                            "cache_seed": 42,
-                                            "timeout": 600,
-                                            "max_tokens": MODEL_TOKEN_LIMITS.get(st.session_state.model, 4096),
-                                            "extra_body": None
-                                        },
-                                        "human_input_mode": "NEVER",
-                                        "max_consecutive_auto_reply": 8,
-                                        "system_message": f"You are a helpful assistant that can act as {expert_name} who {description}."
-                                    },
-                                    "description": description,
-                                    "tools": agent_tools,
-                                    "created_at": current_timestamp,
-                                    "updated_at": current_timestamp,
-                                    "user_id": "default",
-                                    "models": [model for model in MODEL_CHOICES if model != "default"],
-                                    "verbose": False,
-                                    "allow_delegation": False,
-                                    "timestamp": current_timestamp
-                                }
-                                crewai_agent_data = {
-                                    "name": expert_name,
-                                    "description": description,
-                                    "tools": agent_tools,
-                                    "verbose": True,
-                                    "allow_delegation": True
-                                }
-                                autogen_agents.append(autogen_agent_data)
-                                crewai_agents.append(crewai_agent_data)
-                            print(f"AutoGen Agents: {autogen_agents}")
-                            print(f"CrewAI Agents: {crewai_agents}")
-                            st.session_state.workflow.agents = [AgentBaseModel.from_dict(agent) for agent in autogen_agents]
-                            return autogen_agents, crewai_agents
-                        else:
-                            print("Invalid JSON format. Expected a list of agents.")
-                            return [], []
-                    except json.JSONDecodeError as e:
-                        print(f"Error parsing JSON: {e}")
-                        print(f"Content: {content}")
-                        json_data = extract_json_objects(content)
-                        if json_data:
-                            autogen_agents = []
-                            crewai_agents = []
-                            for index, agent_data in enumerate(json_data, start=1):
-                                expert_name = agent_data.get('expert_name', '')
-                                if not expert_name:
-                                    print("Missing agent name. Retrying...")
-                                    retry_count += 1
-                                    time.sleep(retry_delay)
-                                    continue
-                                description = agent_data.get('description', '')
-                                tools = agent_data.get('tools', [])
-                                agent_tools = st.session_state.selected_tools
-                                current_timestamp = datetime.datetime.now().isoformat()
-                                autogen_agent_data = {
-                                    "id": index,
-                                    "name": expert_name,
-                                    "type": "assistant",
-                                    "config": {
-                                        "name": expert_name,
-                                        "llm_config": {
-                                            "config_list": [
-                                                {
-                                                    "user_id": "default",
-                                                    "timestamp": current_timestamp,
-                                                    "model": st.session_state.model,
-                                                    "base_url": None,
-                                                    "api_type": None,
-                                                    "api_version": None,
-                                                    "description": "OpenAI model configuration"
-                                                }
-                                            ],
-                                            "temperature": st.session_state.temperature,
-                                            "timeout": 600,
-                                            "cache_seed": 42
-                                        },
-                                        "human_input_mode": "NEVER",
-                                        "max_consecutive_auto_reply": 8,
-                                        "system_message": f"You are a helpful assistant that can act as {expert_name} who {description}."
-                                    },
-                                    "description": description,
-                                    "tools": agent_tools,
-                                    "created_at": current_timestamp,
-                                    "updated_at": current_timestamp,
-                                    "user_id": "default",
-                                    "models": [model for model in MODEL_CHOICES if model != "default"],
-                                    "verbose": False,
-                                    "allow_delegation": False,
-                                    "timestamp": current_timestamp
-                                }
-                                crewai_agent_data = {
-                                    "name": expert_name,
-                                    "description": description,
-                                    "tools": agent_tools,
-                                    "verbose": True,
-                                    "allow_delegation": True
-                                }
-                                autogen_agents.append(autogen_agent_data)
-                                crewai_agents.append(crewai_agent_data)
-                            print(f"AutoGen Agents: {autogen_agents}")
-                            print(f"CrewAI Agents: {crewai_agents}")
-                            return autogen_agents, crewai_agents
-                        else:
-                            print("Failed to extract JSON objects from content.")
-                            return [], []
-                else:
-                    print("No agents data found in response")
-            else:
-                print(f"API request failed with status code {response.status_code}: {response.text}")
-        except Exception as e:
-            print(f"Error making API request: {e}")
-            retry_count += 1
-            time.sleep(retry_delay)
-    print(f"Maximum retries ({max_retries}) exceeded. Failed to retrieve valid agent names.")
-    return [], []
+        print(f"Extracted content: {content}")
 
+        json_data = parse_json(content)
+        
+        if not json_data:
+            print("Failed to parse JSON data.")
+            return [], []
+
+        return create_agents(json_data)
+    
+    except Exception as e:
+        print(f"Error in get_agents_from_text: {e}")
+        return [], []
+    
 
 def get_discussion_history():
     return st.session_state.discussion_history
 
 
+@st.cache_data(ttl=3600)  # Cache the result for 1 hour
 def get_provider_models(provider=None):
     if provider is None:
         provider = st.session_state.get('provider', LLM_PROVIDER)
-    return MODEL_CHOICES.get(provider, {})
+    return st.session_state.get('available_models') or FALLBACK_MODEL_TOKEN_LIMITS.get(provider, {})
 
 
 def handle_user_request(session_state):
@@ -631,7 +580,7 @@ def handle_user_request(session_state):
     session_state.project_model.set_re_engineered_prompt(rephrased_text)
 
     if "project_manager_output" not in session_state:
-        project_manager_output = create_project_manager(rephrased_text, API_URL)
+        project_manager_output = create_project_manager(rephrased_text)
 
         if not project_manager_output:
             print("Error: Failed to create Project Manager.")
@@ -684,9 +633,6 @@ def handle_user_request(session_state):
     if team_of_experts_text:
         autogen_agents, crewai_agents = get_agents_from_text(team_of_experts_text)
 
-        print(f"Debug: AutoGen Agents: {autogen_agents}")
-        print(f"Debug: CrewAI Agents: {crewai_agents}")
-
         if not autogen_agents:
             print("Error: No agents created.")
             st.warning("Failed to create agents. Please try again.")
@@ -694,13 +640,20 @@ def handle_user_request(session_state):
 
         session_state.agents = autogen_agents
         session_state.workflow.agents = session_state.agents
-        print(f"Debug: session_state.workflow.agents: {session_state.workflow.agents}")
 
         # Generate the workflow data
         workflow_data, _ = get_workflow_from_agents(autogen_agents)
         workflow_data["created_at"] = datetime.datetime.now().isoformat()
         print(f"Debug: Workflow data: {workflow_data}")
         print(f"Debug: CrewAI agents: {crewai_agents}")
+
+        if workflow_data:
+            autogen_zip_buffer, crewai_zip_buffer = zip_files_in_memory(workflow_data)
+            session_state.autogen_zip_buffer = autogen_zip_buffer
+            session_state.crewai_zip_buffer = crewai_zip_buffer
+        else:
+            session_state.autogen_zip_buffer = None
+            session_state.crewai_zip_buffer = None
 
         # Update the project session state with the workflow data
         session_state.project_model.workflows = [workflow_data]
@@ -709,23 +662,35 @@ def handle_user_request(session_state):
         for agent in workflow_data["receiver"]["groupchat_config"]["agents"]:
             print(agent)
 
-        autogen_zip_buffer, crewai_zip_buffer = zip_files_in_memory(workflow_data)
-        session_state.autogen_zip_buffer = autogen_zip_buffer
-        session_state.crewai_zip_buffer = crewai_zip_buffer
+        # Indicate that a rerun is needed
+        session_state.need_rerun = True
     else:
         print("Error: 'Team of Experts' section not found in Project Manager's output.")
         st.warning("Failed to extract the team of experts from the Project Manager's output. Please try again.")
         return
-
+    
 
 def key_prompt():
     api_key = get_api_key()
-    if api_key is None:
-        api_key = display_api_key_input()
+    api_key = display_api_key_input()
     if api_key is None:
         llm = LLM_PROVIDER.upper()
-        st.warning(f"{llm}_API_KEY not found. Please enter your API key.")
+        st.warning(f"{llm}_API_KEY not found, or select a different provider.")
         return
+
+
+def parse_json(content: str) -> List[Dict[str, Any]]:
+    try:
+        json_data = json.loads(content)
+        if isinstance(json_data, list):
+            return json_data
+        else:
+            print("JSON data is not a list as expected.")
+            return []
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON: {e}")
+        print(f"Content: {content}")
+        return []
 
 
 def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, provider=None):
@@ -734,7 +699,6 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
     refactoring_prompt = get_rephrased_user_prompt(user_request)
 
     if llm_provider is None:
-        # Use the existing functionality for non-CLI calls
         api_key = get_api_key()
         try:
             llm_provider = get_llm_provider(api_key=api_key, provider=provider)
@@ -743,7 +707,7 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
             return None
 
     if max_tokens is None:
-        max_tokens = MODEL_TOKEN_LIMITS.get(model, 4096)
+        max_tokens = llm_provider.get_available_models().get(model, 4096)
 
     llm_request_data = {
         "model": model,
@@ -769,23 +733,20 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
         print(f" Messages: {llm_request_data['messages']}")
 
         response = llm_provider.send_request(llm_request_data)
-        print(f"Response received. Status Code: {response.status_code}")
-        print(f"Response Content: {response.text}")
+        
+        if response is None:
+            print("Error: No response received from the LLM provider.")
+            return None
 
-        if response.status_code == 200:
-            print("Request successful. Parsing response...")
-            response_data = llm_provider.process_response(response)
-            print(f"Response Data: {json.dumps(response_data, indent=2)}")
+        print(f"Response received. Processing response...")
+        response_data = llm_provider.process_response(response)
+        print(f"Response Data: {json.dumps(response_data, indent=2)}")
 
-            if "choices" in response_data and len(response_data["choices"]) > 0:
-                rephrased = response_data["choices"][0]["message"]["content"]
-                return rephrased.strip()
-            else:
-                print("Error: Unexpected response format. 'choices' field missing or empty.")
-                return None
+        if "choices" in response_data and len(response_data["choices"]) > 0:
+            rephrased = response_data["choices"][0]["message"]["content"]
+            return rephrased.strip()
         else:
-            print(f"Request failed. Status Code: {response.status_code}")
-            print(f"Response Content: {response.text}")
+            print("Error: Unexpected response format. 'choices' field missing or empty.")
             return None
     except Exception as e:
         print(f"An error occurred: {str(e)}")
@@ -794,8 +755,16 @@ def rephrase_prompt(user_request, model, max_tokens=None, llm_provider=None, pro
 
 def select_model():
     provider = st.session_state.get('provider', LLM_PROVIDER)
-    provider_models = MODEL_CHOICES[provider]
     
+    if 'available_models' not in st.session_state or not st.session_state.available_models:
+        fetch_available_models(provider)
+    
+    provider_models = st.session_state.available_models
+    
+    if not provider_models:
+        st.warning(f"No models available for {provider}. Please check your API key and connection.")
+        return None
+
     if 'model' not in st.session_state or st.session_state.model not in provider_models:
         default_model = next(iter(provider_models))
     else:
@@ -833,6 +802,9 @@ def select_provider():
         api_key = get_api_key(selected_provider)
         if api_key is None:
             display_api_key_input(selected_provider)
+        else:
+            # Fetch available models for the selected provider
+            fetch_available_models(selected_provider)
         
         # Clear the model selection when changing providers
         if 'model' in st.session_state:
@@ -863,7 +835,6 @@ def set_temperature():
         "Set Temperature",
         min_value=0.0,
         max_value=1.0,
-        value=st.session_state.get('temperature', 0.3),
         step=0.01,
         key='temperature_slider',
         on_change=update_temperature,
@@ -881,59 +852,131 @@ def show_interfaces():
     
     st.markdown('<div class="user-input">', unsafe_allow_html=True)
     auto_moderate = st.checkbox("Auto-moderate (slow, eats tokens, but very cool)", key="auto_moderate", on_change=trigger_moderator_agent_if_checked)
-    if auto_moderate and not st.session_state.get("user_input"):
-        moderator_response = trigger_moderator_agent()
+    if auto_moderate:
+        with st.spinner("Auto-moderating..."):
+            moderator_response = trigger_moderator_agent()
         if moderator_response:
-            st.session_state.user_input = moderator_response
-    user_input, reference_url = display_user_input()
+            if st.session_state.next_agent:
+                st.session_state.user_input = f"To {st.session_state.next_agent}: {moderator_response}"
+            else:
+                st.session_state.user_input = moderator_response
+            st.success("Auto-moderation complete. New input has been generated.")
+        else:
+            st.warning("Auto-moderation failed due to rate limiting. Please wait a moment and try again, or proceed manually.")
+    
+    user_input = st.text_area("Additional Input:", value=st.session_state.user_input, height=200, key="user_input_widget")
+    reference_url = st.text_input("URL:", key="reference_url_widget")
+    
     st.markdown('</div>', unsafe_allow_html=True)
+
+    return user_input, reference_url
 
 
 def trigger_moderator_agent():
-    goal = st.session_state.current_project.re_engineered_prompt
+    current_project = st.session_state.current_project
+    goal = current_project.re_engineered_prompt
     last_speaker = st.session_state.last_agent
     last_comment = st.session_state.last_comment
     discussion_history = st.session_state.discussion_history
 
+    deliverable_index, current_deliverable = current_project.get_next_unchecked_deliverable()
+    
+    if current_deliverable is None:
+        if current_project.current_phase != "Deployment":
+            current_project.move_to_next_phase()
+            st.success(f"Moving to {current_project.current_phase} phase!")
+            deliverable_index, current_deliverable = current_project.get_next_unchecked_deliverable()
+        else:
+            st.success("All deliverables have been completed and deployed!")
+            return None
+
+    current_phase = current_project.get_next_uncompleted_phase(deliverable_index)
+    
     team_members = []
     for agent in st.session_state.agents:
-        team_members.append(f"{agent['config']['name']}: {agent['description']}")
+        if isinstance(agent, AgentBaseModel):
+            team_members.append(f"{agent.name}: {agent.description}")
+        else:
+            # Fallback for dictionary-like structure
+            agent_name = agent.get('config', {}).get('name', agent.get('name', 'Unknown'))
+            agent_description = agent.get('description', 'No description')
+            team_members.append(f"{agent_name}: {agent_description}")
     team_members_str = "\n".join(team_members)
 
-    moderator_prompt = get_moderator_prompt(discussion_history, goal, last_comment, last_speaker,team_members_str)
+    moderator_prompt = get_moderator_prompt(discussion_history, goal, last_comment, last_speaker, team_members_str, current_deliverable, current_phase)
 
-    api_key = get_api_key()
-    llm_provider = get_llm_provider(api_key=api_key)
-    llm_request_data = {
-        "model": st.session_state.model,
-        "temperature": st.session_state.temperature,
-        "max_tokens": st.session_state.max_tokens,
-        "top_p": 1,
-        "stop": "TERMINATE",
-        "messages": [
-            {
-                "role": "user",
-                "content": moderator_prompt
-            }
-        ]
-    }
-    # wait for RETRY_DELAY seconds
-    retry_delay = RETRY_DELAY
-    time.sleep(retry_delay)
-    response = llm_provider.send_request(llm_request_data)
+    for attempt in range(MAX_RETRIES):
+        api_key = get_api_key()
+        llm_provider = get_llm_provider(api_key=api_key)
+        llm_request_data = {
+            "model": st.session_state.model,
+            "temperature": st.session_state.temperature,
+            "max_tokens": st.session_state.max_tokens,
+            "top_p": 1,
+            "stop": "TERMINATE",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": moderator_prompt
+                }
+            ]
+        }
+        retry_delay = RETRY_DELAY
+        time.sleep(retry_delay)
+        response = llm_provider.send_request(llm_request_data)
 
-    if response.status_code == 200:
-        response_data = llm_provider.process_response(response)
-        if "choices" in response_data and response_data["choices"]:
-            content = response_data["choices"][0]["message"]["content"]
+        if isinstance(response, dict) and 'choices' in response:
+            # Handle response from providers like Groq
+            content = response['choices'][0]['message']['content']
+        elif hasattr(response, 'content') and isinstance(response.content, list):
+            # Handle Anthropic-style response
+            content = response.content[0].text
+        else:
+            print(f"Unexpected response format: {type(response)}")
+            continue
+
+        if content:
+            # Extract the agent name from the content
+            agent_name_match = re.match(r"To (\w+( \w+)*):", content)
+            if agent_name_match:
+                next_agent = agent_name_match.group(1)
+                # Check if the extracted name is a valid agent and not a tool
+                if any(agent.name.lower() == next_agent.lower() for agent in st.session_state.agents):
+                    st.session_state.next_agent = next_agent
+                    # Remove the "To [Agent Name]:" prefix from the content
+                    content = re.sub(r"^To \w+( \w+)*:\s*", "", content).strip()
+                else:
+                    st.warning(f"'{next_agent}' is not a valid agent. Please select a valid agent.")
+                    st.session_state.next_agent = None
+            else:
+                st.session_state.next_agent = None
+            
+            if "PHASE_COMPLETED" in content:
+                current_project.mark_deliverable_phase_done(deliverable_index, current_phase)
+                content = content.replace("PHASE_COMPLETED", "").strip()
+                st.success(f"Phase {current_phase} completed for deliverable: {current_deliverable}")
+            
+            if "DELIVERABLE_COMPLETED" in content:
+                current_project.mark_deliverable_done(deliverable_index)
+                content = content.replace("DELIVERABLE_COMPLETED", "").strip()
+                st.success(f"Deliverable completed: {current_deliverable}")
+            
             return content.strip()
 
+    logger.error("All retry attempts failed.")
     return None
 
 
 def trigger_moderator_agent_if_checked():
     if st.session_state.get("auto_moderate", False):
-        trigger_moderator_agent()
+        with st.spinner("Auto-moderating..."):
+            moderator_response = trigger_moderator_agent()
+        if moderator_response:
+            st.session_state.user_input = moderator_response
+            st.success("Auto-moderation complete. New input has been generated.")
+        else:
+            st.warning("Auto-moderation did not produce a response. Please try again or proceed manually.")
+    st.experimental_rerun()
 
 
 def update_api_url(provider):
@@ -941,31 +984,36 @@ def update_api_url(provider):
     st.session_state.api_url = st.session_state.get(api_url_key)
 
 
+def update_deliverable_status(index):
+    current_project = st.session_state.current_project
+    is_checked = st.session_state[f"deliverable_{index}"]
+    if is_checked:
+        for phase in current_project.implementation_phases:
+            current_project.mark_deliverable_phase_done(index, phase)
+    else:
+        current_project.deliverables[index]["done"] = False
+        for phase in current_project.implementation_phases:
+            current_project.deliverables[index]["phase"][phase] = False
+    st.experimental_rerun()
+
+
 def update_discussion_and_whiteboard(agent_name, response, user_input):
+    # Update the full discussion history
     if user_input:
-        user_input_text = f"\n\n\n\n{user_input}\n\n"
+        user_input_text = f"\n\nUser: {user_input}\n\n"
         st.session_state.discussion_history += user_input_text
 
-    if "last_agent" not in st.session_state or st.session_state.last_agent != agent_name:
-        response_text = f"{agent_name}:\n\n{response}\n\n===\n\n"
-    else:
-        response_text = f"{response}\n\n===\n\n"
+    # Format the most recent response
+    st.session_state.most_recent_response = f"{agent_name}:\n\n{response}\n\n"
 
-    st.session_state.discussion_history += response_text
-    code_blocks = extract_code_from_response(response)
-    st.session_state.whiteboard = code_blocks
+    # Add the new response to the full discussion history
+    st.session_state.discussion_history += st.session_state.most_recent_response
+
     st.session_state.last_agent = agent_name
-    st.session_state.last_comment = response_text
+    st.session_state.last_comment = response
 
-    if st.session_state.get("auto_moderate", False):
-        moderator_response = trigger_moderator_agent()
-        if moderator_response:
-            st.session_state.user_input = moderator_response
-        else:
-            st.session_state.user_input = ""
-        
-        # Update the 'Additional Input:' text area with the moderator response or an empty string
-        # st.text_area("Additional Input:", value=st.session_state.user_input, key="user_input_widget_auto_moderate", height=100, on_change=update_user_input)
+    # Force a rerun to update the UI
+    st.experimental_rerun()
 
 
 def update_user_input():
@@ -973,5 +1021,3 @@ def update_user_input():
         st.session_state.user_input = st.session_state.user_input_widget_auto_moderate
     else:
         st.session_state.user_input = st.session_state.user_input_widget
-
-

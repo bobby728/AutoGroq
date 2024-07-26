@@ -6,7 +6,7 @@ import requests
 import streamlit as st
 import time
 
-from configs.config import API_URL, LLM_PROVIDER, RETRY_DELAY, RETRY_TOKEN_LIMIT, SUPPORTED_PROVIDERS
+from configs.config import FALLBACK_MODEL_TOKEN_LIMITS, LLM_PROVIDER, RETRY_DELAY, RETRY_TOKEN_LIMIT
 
 
 def display_api_key_input(provider=None):
@@ -16,15 +16,29 @@ def display_api_key_input(provider=None):
     api_key = os.environ.get(api_key_env_var)
     
     if api_key is None:
-        st.session_state.warning_placeholder.warning(f"{provider.upper()} API Key not found. Please enter your API key.")
-        api_key = st.text_input(f"Enter your {provider.upper()} API Key:", type="password", key=f"api_key_input_{provider}")
-        if api_key:
-            st.session_state[api_key_env_var] = api_key
-            os.environ[api_key_env_var] = api_key
-            st.success(f"{provider.upper()} API Key entered successfully.")
-            st.session_state.warning_placeholder.empty()
+        st.session_state.warning_placeholder.warning(f"{provider.upper()} API Key not found. Please enter your API key, or select a different provider.")
+    api_key = st.text_input(f"Enter your {provider.upper()} API Key:", type="password", key=f"api_key_input_{provider}")
+    if api_key:
+        st.session_state[api_key_env_var] = api_key
+        os.environ[api_key_env_var] = api_key
+        # st.success(f"{provider.upper()} API Key entered successfully.")
+        st.session_state.warning_placeholder.empty()
     return api_key
 
+
+def fetch_available_models(provider=None):
+    if provider is None:
+        provider = st.session_state.get('provider', LLM_PROVIDER)
+    api_key = get_api_key(provider)
+    llm_provider = get_llm_provider(api_key=api_key, provider=provider)
+    try:
+        models = llm_provider.get_available_models()
+        st.session_state.available_models = models
+        return models
+    except Exception as e:
+        st.error(f"Failed to fetch available models for {provider}: {str(e)}")
+        return FALLBACK_MODEL_TOKEN_LIMITS.get(provider, {})
+    
 
 def get_api_key(provider=None):
     if provider is None:
